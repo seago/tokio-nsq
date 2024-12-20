@@ -5,7 +5,12 @@ use ::backoff::backoff::Backoff;
 use ::futures::Future;
 use ::futures_util::FutureExt;
 use ::log::*;
-use ::rustls::*;
+use ::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use ::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use ::rustls::Error as TLSError;
+use ::rustls::{DigitallySignedStruct, SignatureScheme};
 use ::std::convert::TryFrom;
 use ::std::pin::Pin;
 use ::std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -20,8 +25,8 @@ use ::tokio::io::AsyncWrite;
 use ::tokio::io::AsyncWriteExt;
 use ::tokio::io::ReadBuf;
 use ::tokio::time::{sleep, Sleep};
-use ::tokio_rustls::webpki::DNSNameRef;
-use ::tokio_rustls::{rustls::ClientConfig, TlsConnector};
+use ::tokio_rustls::rustls::ClientConfig;
+use ::tokio_rustls::TlsConnector;
 
 use crate::built_info;
 use crate::connection_config::*;
@@ -42,17 +47,41 @@ struct ProtocolError {
     message: String,
 }
 
+#[derive(Debug)]
 struct Unverified {}
 
 impl ServerCertVerifier for Unverified {
     fn verify_server_cert(
         &self,
-        _roots: &RootCertStore,
-        _presented_certs: &[Certificate],
-        _dns_name: DNSNameRef,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
+        _now: UnixTime,
     ) -> Result<ServerCertVerified, TLSError> {
         Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TLSError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TLSError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![]
     }
 }
 
@@ -756,18 +785,21 @@ async fn run_connection(state: &mut NSQDConnectionState) -> Result<(), Error> {
 
     let (stream_rx, stream_tx) = if let Some(config_tls) = config_tls {
         let verifier = Arc::new(Unverified {});
-
-        let config = match &config_tls.client_config {
-            Some(client_config) => client_config.clone(),
-            None => {
-                let mut config = ClientConfig::new();
-                config.dangerous().set_certificate_verifier(verifier);
-                Arc::new(config)
-            }
-        };
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let config = Arc::new(config);
 
         let config = TlsConnector::from(config);
-        let dnsname = DNSNameRef::try_from_ascii_str(&config_tls.domain_name)?;
+        let ip: std::net::Ipv4Addr =
+            config_tls.domain_name.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "invalid IP address",
+                )
+            })?;
+        let dnsname = ServerName::from(ip);
 
         // Turn stream back into TcpStream as rustls does buffering itself
         let stream = stream.into_inner().into_inner();
@@ -1122,7 +1154,7 @@ where
         cx: &mut std::task::Context,
         buf: &mut ReadBuf,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut me = Pin::into_inner(self);
+        let me = Pin::into_inner(self);
         if Pin::new(&mut me.inner).poll_read(cx, buf).is_ready() {
             me.read_delay = None;
             return Poll::Ready(Ok(()));
@@ -1155,7 +1187,7 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let mut me = Pin::into_inner(self);
+        let me = Pin::into_inner(self);
         if let Poll::Ready(n) = Pin::new(&mut me.inner).poll_write(cx, buf) {
             me.write_delay = None;
             return Poll::Ready(n);
@@ -1182,7 +1214,7 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut me = Pin::into_inner(self);
+        let me = Pin::into_inner(self);
         if Pin::new(&mut me.inner).poll_flush(cx).is_ready() {
             me.write_delay = None;
             return Poll::Ready(Ok(()));
@@ -1209,7 +1241,7 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut me = Pin::into_inner(self);
+        let me = Pin::into_inner(self);
         if Pin::new(&mut me.inner).poll_shutdown(cx).is_ready() {
             me.write_delay = None;
             return Poll::Ready(Ok(()));
